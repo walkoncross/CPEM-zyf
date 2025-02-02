@@ -1,0 +1,27 @@
+[build-system]
+requires = [
+    "setuptools>=75.0.0",
+    "wheel",
+    "Cython>=3.0.0",
+    "numpy>=1.19.0",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mot_utils"
+version = "0.1.0"
+description = "MOT utilities including NMS implementation"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=1.19.0",
+]
+
+[tool.setuptools]
+packages = ["nms"]
+ext-modules = [
+    {name = "nms.cpu_nms", sources = ["nms/cpu_nms.pyx"], extra-compile-args=["-Wno-cpp", "-Wno-unused-function"]}
+]
+
+[tool.cython-build]
+annotate = true
+compiler-directives = {language_level = "3"} 
