@@ -370,8 +370,9 @@ class TestSolver(object):
 
                 face_shape, tri, face_color = retargeted_mesh
                 face_shape = face_shape[0].detach().cpu()
+                face_shape[:, 2] = -face_shape[:, 2] # pytorch3d camera coordinate -> opengl camera coordinate
                 tri = tri[0].detach().cpu()
-                face_color = face_color[0].detach().cpu()
+                face_color = face_color[0].detach().cpu() / 255.0
                 obj_name = base_input_name + '_mesh.obj'
                 write_obj(os.path.join(save_path, obj_name), face_shape, tri + 1, face_color)
 
