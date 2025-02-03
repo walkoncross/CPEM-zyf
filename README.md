@@ -21,13 +21,29 @@ Proceedings of the AAAI Conference on Artificial Intelligence(AAAI), 2022
 ## Dependencies
 
 * pytorch>=1.7.0
-* [pytorch3d](https://github.com/facebookresearch/pytorch3d)
+* [pytorch3d](https://github.com/facebookresearch/pytorch3d) (Can be replaced by cpu_renderer from 3DDFA_v3 on platform without GPU for inference, because pytorch3d is too slow)
 * [face_alignment](https://github.com/1adrianb/face-alignment)
 * [facenet_pytorch](https://github.com/timesler/facenet-pytorch)
 * opencv-python
 * numpy
 * pyyaml
 * scipy
+
+**CPU rendering**
+
+Use a cpu renderer from 3DDFA-V3 instead for testing (which can work on MacOS):
+```
+git clone --depth=1 https://github.com/wang-zidu/3DDFA-V3
+cp 3DDFA-V3/utils/cpu_renderer.py ./core/
+cp -r 3DDFA-V3/utils/cython_renderer ./core/
+
+pip install Cython
+
+cd core/cython_renderer/
+python setup.py build_ext -i
+cd ../..     # ./CPEM
+```
+
 
 ## Getting Started
 

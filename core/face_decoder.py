@@ -1,18 +1,25 @@
 import numpy as np
 from scipy.io import loadmat, savemat
 import torch
-from pytorch3d.structures import Meshes
-from pytorch3d.renderer import (
-    look_at_view_transform,
-    FoVPerspectiveCameras,
-    PointLights,
-    RasterizationSettings,
-    MeshRenderer,
-    MeshRasterizer,
-    SoftPhongShader,
-    TexturesVertex,
-    blending
-)
+
+USE_GPU_RENDERER = torch.cuda.is_available()
+
+if USE_GPU_RENDERER:
+    from pytorch3d.structures import Meshes
+    from pytorch3d.renderer import (
+        look_at_view_transform,
+        FoVPerspectiveCameras,
+        PointLights,
+        RasterizationSettings,
+        MeshRenderer,
+        MeshRasterizer,
+        SoftPhongShader,
+        TexturesVertex,
+        blending
+    )
+else:
+    print('CUDA is not available. Use cpu renderer...')
+    from core.cpu_renderer import MeshRenderer_cpu as MeshRenderer
 
 class FaceModel():
     def __init__(self, model_path, delta_bs_path, device=torch.device('cuda')):
@@ -151,32 +158,46 @@ class FaceDecoder():
 
 
     def get_renderer(self, device):
-        R, T = look_at_view_transform(10, 0, 0)
-        cameras = FoVPerspectiveCameras(device=device, R=R, T=T, znear=0.01, zfar=50,
-                                        fov=2 * np.arctan(self.img_size // 2 / self.focal) * 180. / np.pi)
+        if USE_GPU_RENDERER:
+            R, T = look_at_view_transform(10, 0, 0)
+            cameras = FoVPerspectiveCameras(device=device, R=R, T=T, znear=0.01, zfar=50,
+                                            fov=2 * np.arctan(self.img_size // 2 / self.focal) * 180. / np.pi)
 
-        lights = PointLights(device=device, location=[[0.0, 0.0, 1e5]], ambient_color=[[1, 1, 1]],
-                             specular_color=[[0., 0., 0.]], diffuse_color=[[0., 0., 0.]])
+            lights = PointLights(device=device, location=[[0.0, 0.0, 1e5]], ambient_color=[[1, 1, 1]],
+                                specular_color=[[0., 0., 0.]], diffuse_color=[[0., 0., 0.]])
 
-        raster_settings = RasterizationSettings(
-            image_size=self.img_size,
-            blur_radius=0.0,
-            faces_per_pixel=1,
-        )
-        blend_params = blending.BlendParams(background_color=[0, 0, 0])
-
-        renderer = MeshRenderer(
-            rasterizer=MeshRasterizer(
-                cameras=cameras,
-                raster_settings=raster_settings
-            ),
-            shader=SoftPhongShader(
-                device=device,
-                cameras=cameras,
-                lights=lights,
-                blend_params=blend_params
+            raster_settings = RasterizationSettings(
+                image_size=self.img_size,
+                blur_radius=0.0,
+                faces_per_pixel=1,
             )
-        )
+            blend_params = blending.BlendParams(background_color=[0, 0, 0])
+
+            renderer = MeshRenderer(
+                rasterizer=MeshRasterizer(
+                    cameras=cameras,
+                    raster_settings=raster_settings
+                ),
+                shader=SoftPhongShader(
+                    device=device,
+                    cameras=cameras,
+                    lights=lights,
+                    blend_params=blend_params
+                )
+            )
+        else:
+            fov = 2 * np.arctan(self.img_size // 2 / self.focal) * 180. / np.pi
+
+            renderer = MeshRenderer(
+                rasterize_fov=fov,
+                rasterize_size=self.img_size,
+                znear=0.01,
+                zfar=50, 
+                # znear=5,
+                # zfar=15, 
+                use_opengl=False
+            )
+
         return renderer
 
 
@@ -248,7 +269,7 @@ class FaceDecoder():
         v3 = shape[:, face_id[:, 2], :]
         e1 = v1 - v2
         e2 = v2 - v3
-        face_norm = e1.cross(e2)
+        face_norm = e1.cross(e2, dim=None)
         empty = torch.zeros((face_norm.size(0), 1, 3), dtype=face_norm.dtype, device=face_norm.device)
         face_norm = torch.cat((face_norm, empty), 1)
         v_norm = face_norm[:, point_id, :].sum(2)
@@ -360,7 +381,9 @@ class FaceDecoder():
 
         rotXYZ = torch.eye(3).view(1, 3, 3).repeat(n_b * 3, 1, 1).view(3, n_b, 3, 3)
 
-        if angles.is_cuda: rotXYZ = rotXYZ.cuda()
+        # if angles.is_cuda: rotXYZ = rotXYZ.cuda()
+        if rotXYZ.device != angles.device:
+            rotXYZ = rotXYZ.to(device=angles.device)
 
         rotXYZ[0, :, 1, 1] = cosx
         rotXYZ[0, :, 1, 2] = -sinx
@@ -420,11 +443,30 @@ class FaceDecoder():
             landmarks_2d_neutral = torch.stack([landmarks_2d_neutral[:, :, 0], self.img_size - 1.0 - landmarks_2d_neutral[:, :, 1]], dim=2)
 
         tri = self.facemodel.tri - 1
-        face_color_pytorch3d = TexturesVertex(face_color)
-        mesh = Meshes(face_shape_t, tri.repeat(batch_num, 1, 1), face_color_pytorch3d)
-        rendered_img = self.renderer(mesh)
-        rendered_img = torch.clamp(rendered_img, 0, 255)
 
+        if USE_GPU_RENDERER:
+            face_color_pytorch3d = TexturesVertex(face_color)
+            mesh = Meshes(face_shape_t, tri.repeat(batch_num, 1, 1), face_color_pytorch3d)
+            rendered_img = self.renderer(mesh)
+            rendered_img = torch.clamp(rendered_img, 0, 255)
+        else:
+            # rendered_img = torch.zeros((batch_num, self.img_size, self.img_size, 4), dtype=torch.uint8, device=self.device)
+            rendered_img_list = []
+            for ii in range(batch_num): # cpu renderer only supports batch size of 1
+                face_shape_in_cpu_render = face_shape_t[ii]
+                face_shape_in_cpu_render[..., -1] = 10 - face_shape_in_cpu_render[..., -1] # convert to camera coordinate system
+
+                single_rendered_result = self.renderer(
+                    face_shape_in_cpu_render.unsqueeze(0),
+                    tri,
+                    face_color[ii].unsqueeze(0),
+                )
+                single_rendered_img = torch.concat([single_rendered_result[2], single_rendered_result[0]], dim=1)
+                single_rendered_img = torch.clamp(single_rendered_img, 0, 255)
+                single_rendered_img = single_rendered_img.permute(0, 2, 3, 1)
+                rendered_img_list.append(single_rendered_img)
+
+            rendered_img = torch.concat(rendered_img_list, dim=0)
 
         if return_coeffs:
             coeffs = {

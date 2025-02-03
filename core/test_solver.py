@@ -19,7 +19,16 @@ class TestSolver(object):
     def __init__(self, opts):
         self.opts = opts
         # device
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if torch.cuda.is_available():
+            print('--> GPU is available! Running on GPU...')
+            self.device = torch.device('cuda')
+        elif torch.mps.is_available():
+            print('--> MPS is available! Running on MPS...')
+            self.device = torch.device('mps')
+        else:
+            print('--> GPU and MPS are not available! Running on CPU...')
+            self.device = torch.device('cpu')
 
         # face decoder
         self.FaceDecoder = FaceDecoder(opts.gpmm_model_path, opts.gpmm_delta_bs_path, batch_size=self.opts.batch_size, device=self.device, img_size=opts.input_size)
@@ -113,33 +122,45 @@ class TestSolver(object):
         with torch.no_grad():
             length = len(frame_paths)
             for idx, frame_path in enumerate(frame_paths):
-                print('process frames [{}/{}].'.format(idx+1, length))
+                print('==> Process frames [{}/{}].'.format(idx+1, length))
+                print(f"--> Processing {frame_path}")
 
                 frame = cv2.imread(frame_path)
+
+                print("detecting face...")
                 # detect bbox
                 if self.opts.detect_type == 'box':
                     boxes = face_detector(frame)
                     if len(boxes) == 0:
                         print('No face detected of {}'.format(frame_path))
                         continue
+                    print(f"--> {len(boxes)} faces detected, using the first one.")
                     bbox = boxes[0]
                 else:
                     bbox, _ = face_detector.detect(frame)
                     if bbox is None:
                         print('No face detected of {}'.format(frame_path))
                         continue
+                    print(f"--> {len(boxes)} faces detected, using the first one.")
+                
+
+                print("preprocessing data...")
                 # preprocess data
                 # [bs, c, h, w]
                 input_data, roi_box = Preprocess(frame, self.opts.input_size, bbox, self.opts.detect_type, return_box=True)
                 input_data = input_data.to(self.device)
+
+                print("network inference...")
                 # network inference
                 pred_coeffs = self.network(input_data)  # [bs, 159]
 
+                print("decoding face...")
                 # rendered_img: [1, h, w, 4]
                 rendered_img, pred_lm2d, coeffs, mesh = self.FaceDecoder.decode_face(pred_coeffs, return_coeffs=True)
                 render_mask = rendered_img[:, :, :, 3].detach()
                 rendered_img = rendered_img[:, :, :, :3]
 
+                print("saving results...")
                 # save retargeting parameters
                 coeff_bs = coeffs['coeff_bs']
                 coeff_angle = coeffs['coeff_angle']
@@ -193,8 +214,9 @@ class TestSolver(object):
                 # save mesh
                 face_shape, tri, face_color = mesh
                 face_shape = face_shape[0].detach().cpu()
+                face_shape[:, 2] = -face_shape[:, 2] # pytorch3d camera coordinate -> opengl camera coordinate
                 tri = tri[0].detach().cpu()
-                face_color = face_color[0].detach().cpu()
+                face_color = face_color[0].detach().cpu() / 255.0
                 obj_name = base_input_name + '_mesh.obj'
                 write_obj(os.path.join(mesh_save_path, obj_name), face_shape, tri + 1, face_color)
 
@@ -267,7 +289,7 @@ class TestSolver(object):
 
                 from render_api import render
                 eval_overlay_image = frame.copy()
-                overlay_image = render(eval_overlay_image, face_shape_2d_ori_array, triangle_array, alpha=1.0)
+                overlay_image = render(eval_overlay_image, face_shape_2d_ori_array, triangle_array, alpha=0.8)
 
                 base_input_name = os.path.basename(image_path)[:-4]
                 overlay_name = base_input_name + '_overlay.jpg'
