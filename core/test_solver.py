@@ -121,7 +121,7 @@ class TestSolver(object):
         self.network.eval()
         with torch.no_grad():
             length = len(frame_paths)
-            for idx, frame_path in enumerate(frame_paths):
+            for idx, frame_path in enumerate(frame_paths[:60]):
                 print('==> Process frames [{}/{}].'.format(idx+1, length))
                 print(f"--> Processing {frame_path}")
 
@@ -225,8 +225,8 @@ class TestSolver(object):
             coeff_bs_array = coeff_bs_array.cpu().numpy()
             coeff_angle_array = coeff_angle_array.cpu().numpy()
 
-            coeff_bs_name = 'coeff_bs.npy'
-            coeff_angle_name = 'coeff_angle.npy'
+            coeff_bs_name = 'coeff_bs.txt'
+            coeff_angle_name = 'coeff_angle.txt'
 
             np.savetxt(os.path.join(save_path, coeff_bs_name), coeff_bs_array)
             np.savetxt(os.path.join(save_path, coeff_angle_name), coeff_angle_array)
