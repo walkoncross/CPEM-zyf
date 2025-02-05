@@ -522,6 +522,120 @@ class TestSolver(object):
                 overlay_name = base_input_name + '_overlay.jpg'
                 cv2.imwrite(os.path.join(save_path, overlay_name), overlay_image)
 
+    def render_shape_from_recon_results(
+        self,
+        recon_coeff_path,
+        ignore_id=False,
+        ignore_bs=False,
+        ignore_pose=False,
+        freeze_texture=False,
+        freeze_light=False,
+        save_mesh=False,
+    ):
+        # from render_api import render
+
+        assert os.path.isdir(recon_coeff_path), "recon coeff path is not exist!"
+
+        if self.opts.save_path is None:
+            save_path = os.path.join(
+                self.opts.result_root,
+                "render_recon_results_{}".format(recon_coeff_path),
+            )
+        else:
+            save_path = self.opts.save_path
+
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+
+        # file dirs or file path
+        if os.path.isfile(recon_coeff_path):
+            src_coeff_path_list = [recon_coeff_path]
+        else:
+            src_coeff_path_list = glob.glob(os.path.join(recon_coeff_path, "*.mat"))
+            src_coeff_path_list.sort()
+
+        is_first_frame = True
+        for coeff_path in tqdm(src_coeff_path_list):
+            # fetch retargeting parameters
+            src_coeffs = loadmat(coeff_path)
+
+            if ignore_id:
+                src_id_coeff = np.zeros_like(src_coeffs["coeff_id"])
+            else:
+                src_id_coeff = src_coeffs["coeff_id"]
+
+            if ignore_bs:
+                src_bs_coeff = np.zeros_like(src_coeffs["coeff_bs"])
+            else:
+                src_bs_coeff = src_coeffs["coeff_bs"]
+
+            if is_first_frame or not freeze_texture:
+                src_tex_coeff = src_coeffs["coeff_tex"]
+
+            if ignore_pose:
+                src_angles = np.zeros_like(src_coeffs["coeff_angle"])
+                src_translation = np.zeros_like(src_coeffs["coeff_translation"])
+            else:
+                src_angles = src_coeffs["coeff_angle"]
+                src_translation = src_coeffs["coeff_translation"]
+
+            if is_first_frame or not freeze_light:
+                src_gamma = src_coeffs["coeff_light"]
+
+            is_first_frame = False
+
+            src_id_coeff = torch.from_numpy(src_id_coeff).to(self.device)
+            src_bs_coeff = torch.from_numpy(src_bs_coeff).to(self.device)
+
+            if isinstance(src_tex_coeff, np.ndarray):
+                src_tex_coeff = torch.from_numpy(src_tex_coeff).to(self.device)
+
+            src_angles = torch.from_numpy(src_angles).to(self.device)
+
+            if isinstance(src_gamma, np.ndarray):
+                src_gamma = torch.from_numpy(src_gamma).to(self.device)
+
+            src_translation = torch.from_numpy(src_translation).to(self.device)
+
+            # get rendering result
+            combined_coeffs = torch.cat(
+                [
+                    src_id_coeff,
+                    src_bs_coeff,
+                    src_tex_coeff,
+                    src_angles,
+                    src_gamma,
+                    src_translation,
+                ],
+                dim=1,
+            )
+            rendered_img, _, _, retargeted_mesh = self.FaceDecoder.decode_face(
+                combined_coeffs, return_coeffs=True
+            )
+            rendered_img = rendered_img[:, :, :, :3]
+
+            rendered_img = rendered_img.squeeze().cpu().numpy()
+            rendered_img = rendered_img[:, :, ::-1]  # [h,w,c] BGR
+
+            base_input_name = os.path.splitext(os.path.basename(coeff_path))[0]
+
+            # save rendering result
+            render_name = base_input_name + ".jpg"
+            cv2.imwrite(os.path.join(save_path, render_name), rendered_img)
+
+            if save_mesh:
+                face_shape, tri, face_color = retargeted_mesh
+                face_shape = face_shape[0].detach().cpu()
+                face_shape[:, 2] = -face_shape[
+                    :, 2
+                ]  # pytorch3d camera coordinate -> opengl camera coordinate
+                tri = tri[0].detach().cpu()
+                face_color = face_color[0].detach().cpu() / 255.0
+                obj_name = base_input_name + "_mesh.obj"
+                write_obj(
+                    os.path.join(save_path, obj_name), face_shape, tri + 1, face_color
+                )
+
     def run_facial_motion_retargeting(self, src_coeff_path, target_img_path, face_detector):
         '''
         src_coeff_path: source 3DMM parameter path or dirs with *.mat format

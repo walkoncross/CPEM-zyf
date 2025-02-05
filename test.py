@@ -27,7 +27,7 @@ parser.add_argument('--conv_dim', type=int, default=32, help='number of conv fil
 parser.add_argument('--network_type', default='ResNet50', choices=['ResNet50', 'mobilenet-v2'])
 
 # Test opts.
-parser.add_argument('--mode', type=str, default='demo', choices=['demo', 'retarget', 'render_shape'])
+parser.add_argument('--mode', type=str, default='demo', choices=['demo', 'retarget', 'render_shape', 'render_recon_results'])
 parser.add_argument('--test_iter', type=int, default=300000, help='test model from this step, **only use when checkpoint_path is None')
 parser.add_argument('--image_path', type=str, default=None, help='image directory or image path')
 parser.add_argument('--save_path', type=str, default=None, help='result save path for video')
@@ -64,8 +64,11 @@ if __name__ == '__main__':
         from utils import FAN # landmark detector
         face_detector = FAN()
 
-    ext = os.path.splitext(opts.image_path)[-1]
-    is_video = ext.lower() in ['.mp4', '.avi', '.mov']
+    if opts.image_path is not None:
+        ext = os.path.splitext(opts.image_path)[-1]
+        is_video = ext.lower() in ['.mp4', '.avi', '.mov']
+    else:
+        is_video = False
 
     if opts.mode == 'demo':
         if is_video:
@@ -79,6 +82,16 @@ if __name__ == '__main__':
             solver.render_shape_from_video_path(opts.image_path, face_detector)
         else:
             solver.render_shape(opts.image_path, face_detector)
+    elif opts.mode == "render_recon_results":
+        solver.render_shape_from_recon_results(
+            opts.source_coeff_path,
+            ignore_id=False,
+            ignore_bs=False,
+            ignore_pose=False,
+            freeze_texture=False,
+            freeze_light=False,
+            save_mesh=False,
+        )
 
     print('done!')
 
