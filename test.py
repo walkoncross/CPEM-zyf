@@ -64,13 +64,21 @@ if __name__ == '__main__':
         from utils import FAN # landmark detector
         face_detector = FAN()
 
+    ext = os.path.splitext(opts.image_path)[-1]
+    is_video = ext.lower() in ['.mp4', '.avi', '.mov']
 
     if opts.mode == 'demo':
-        solver.infer_from_image_paths(opts.image_path, face_detector)
+        if is_video:
+            solver.infer_from_video_path(opts.image_path, face_detector)
+        else:
+            solver.infer_from_image_paths(opts.image_path, face_detector)
     elif opts.mode == 'retarget':
         solver.run_facial_motion_retargeting(opts.source_coeff_path, opts.target_image_path, face_detector)
     elif opts.mode == 'render_shape':
-        solver.render_shape(opts.image_path, face_detector)
+        if is_video:
+            solver.render_shape_from_video_path(opts.image_path, face_detector)
+        else:
+            solver.render_shape(opts.image_path, face_detector)
 
     print('done!')
 

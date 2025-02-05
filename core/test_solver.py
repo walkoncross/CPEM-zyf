@@ -12,7 +12,7 @@ from model.mobilenetv2 import MobilenetV2_3DMM
 from core.face_decoder import FaceDecoder
 
 from utils import write_obj
-
+from tqdm import tqdm
 
 class TestSolver(object):
 
@@ -76,7 +76,7 @@ class TestSolver(object):
                 assert False, 'Checkpoint flie not exist!'
 
 
-    def infer_from_image_paths(self, video_path, face_detector):
+    def infer_from_image_paths(self, video_path, face_detector, save_mesh=False):
 
         if os.path.isdir(video_path):
             frame_paths = glob.glob(os.path.join(video_path, '*.jpg')) + glob.glob(os.path.join(video_path, '*.png'))
@@ -104,7 +104,7 @@ class TestSolver(object):
             proj_save_path = os.path.join(save_path, 'proj')
             coeff_save_path = os.path.join(save_path, 'coeffs')
 
-            if not os.path.exists(mesh_save_path):
+            if save_mesh and not os.path.exists(mesh_save_path):
                 os.makedirs(mesh_save_path)
             if not os.path.exists(overlay_save_path):
                 os.makedirs(overlay_save_path)
@@ -120,47 +120,187 @@ class TestSolver(object):
 
         self.network.eval()
         with torch.no_grad():
-            length = len(frame_paths)
-            for idx, frame_path in enumerate(frame_paths[:60]):
-                print('==> Process frames [{}/{}].'.format(idx+1, length))
-                print(f"--> Processing {frame_path}")
-
+            for frame_path in tqdm(frame_paths):
                 frame = cv2.imread(frame_path)
 
-                print("detecting face...")
                 # detect bbox
                 if self.opts.detect_type == 'box':
                     boxes = face_detector(frame)
                     if len(boxes) == 0:
                         print('No face detected of {}'.format(frame_path))
                         continue
-                    print(f"--> {len(boxes)} faces detected, using the first one.")
+                    # print(f"--> {len(boxes)} faces detected, using the first one.")
                     bbox = boxes[0]
                 else:
                     bbox, _ = face_detector.detect(frame)
                     if bbox is None:
                         print('No face detected of {}'.format(frame_path))
                         continue
-                    print(f"--> {len(boxes)} faces detected, using the first one.")
+                    # print(f"--> {len(boxes)} faces detected, using the first one.")
                 
-
-                print("preprocessing data...")
                 # preprocess data
                 # [bs, c, h, w]
                 input_data, roi_box = Preprocess(frame, self.opts.input_size, bbox, self.opts.detect_type, return_box=True)
                 input_data = input_data.to(self.device)
 
-                print("network inference...")
                 # network inference
                 pred_coeffs = self.network(input_data)  # [bs, 159]
 
-                print("decoding face...")
                 # rendered_img: [1, h, w, 4]
                 rendered_img, pred_lm2d, coeffs, mesh = self.FaceDecoder.decode_face(pred_coeffs, return_coeffs=True)
                 render_mask = rendered_img[:, :, :, 3].detach()
                 rendered_img = rendered_img[:, :, :, :3]
 
-                print("saving results...")
+                # save retargeting parameters
+                coeff_bs = coeffs['coeff_bs']
+                coeff_angle = coeffs['coeff_angle']
+                coeff_bs_list.append(coeff_bs)
+                coeff_angle_list.append(coeff_angle)
+
+                # overlay processed image
+                eval_intput_data = input_data * 255 # [0,1] -> [0,255]
+                eval_intput_data = eval_intput_data.permute(0, 2, 3, 1)  # [bs, c, h, w] -> [bs, h, w, c]
+
+                eval_mask = (render_mask > 0).type(torch.uint8)
+                eval_mask = eval_mask.view(eval_mask.size(0), eval_mask.size(1), eval_mask.size(2), 1)
+                eval_mask = eval_mask.repeat(1, 1, 1, 3)
+                eval_overlay_images = rendered_img * eval_mask + eval_intput_data * (1 - eval_mask)
+                eval_overlay_images = eval_overlay_images.cpu().numpy()
+                eval_overlay_image = np.squeeze(eval_overlay_images)[:, :, ::-1] # [h,w,c] BGR
+
+                # overlay original image
+                rendered_img = rendered_img.squeeze().cpu().numpy()
+                rendered_mask = eval_mask.squeeze().cpu().numpy()
+                rendered_img = rendered_img[:, :, ::-1]  # [h,w,c] BGR
+                raw_img = frame.copy()
+                composed_img = overlying_image_resize(roi_box, raw_img, rendered_img, rendered_mask)
+
+                eval_proj_image = frame.copy()
+                # map landmarks to original image
+                pred_lm2d_ori = similar_transform_crop_to_origin(pred_lm2d.squeeze(), roi_box, self.opts.input_size)
+                pred_lm2d_ori = pred_lm2d_ori.cpu().numpy()
+
+                # draw landmarks
+                for k in range(68):
+                    rr1, cc1 = draw.disk((pred_lm2d_ori[k][1], pred_lm2d_ori[k][0]), 2)
+                    draw.set_color(eval_proj_image, [rr1, cc1], [0, 0, 255])
+
+                base_input_name = os.path.basename(frame_path)[:-4]
+                # save parameters
+                coeff_name = base_input_name + '_coeff.mat'
+                for key in coeffs.keys():
+                    coeffs[key] = coeffs[key].cpu().numpy()
+                savemat(os.path.join(coeff_save_path, coeff_name), coeffs)
+                # save cropped overlay image
+                overlay_name = base_input_name + '_overlay_crop.jpg'
+                cv2.imwrite(os.path.join(overlay_save_path, overlay_name), eval_overlay_image)
+                # save overlay image
+                overlay_origin_name = base_input_name + '_overlay.jpg'
+                cv2.imwrite(os.path.join(overlay_origin_save_path, overlay_origin_name), composed_img)
+                # save image with projected landmarks
+                proj_name = base_input_name + '_proj.jpg'
+                cv2.imwrite(os.path.join(proj_save_path, proj_name), eval_proj_image)
+                # save mesh
+                if save_mesh:
+                    face_shape, tri, face_color = mesh
+                    face_shape = face_shape[0].detach().cpu()
+                    face_shape[:, 2] = -face_shape[:, 2] # pytorch3d camera coordinate -> opengl camera coordinate
+                    tri = tri[0].detach().cpu()
+                    face_color = face_color[0].detach().cpu() / 255.0
+                    obj_name = base_input_name + '_mesh.obj'
+                    write_obj(os.path.join(mesh_save_path, obj_name), face_shape, tri + 1, face_color)
+
+            coeff_bs_array = torch.cat(coeff_bs_list)
+            coeff_angle_array = torch.cat(coeff_angle_list)
+            coeff_bs_array = coeff_bs_array.cpu().numpy()
+            coeff_angle_array = coeff_angle_array.cpu().numpy()
+
+            coeff_bs_name = 'coeff_bs.txt'
+            coeff_angle_name = 'coeff_angle.txt'
+
+            np.savetxt(os.path.join(save_path, coeff_bs_name), coeff_bs_array)
+            np.savetxt(os.path.join(save_path, coeff_angle_name), coeff_angle_array)
+
+            coeff_bs_name = 'coeff_bs.npy'
+            coeff_angle_name = 'coeff_angle.npy'
+
+            np.save(os.path.join(save_path, coeff_bs_name), coeff_bs_array)
+            np.save(os.path.join(save_path, coeff_angle_name), coeff_angle_array)
+
+    def infer_from_video_path(self, video_path, face_detector, save_mesh=False):
+        if self.opts.save_path is None:
+            save_path = os.path.join(self.opts.result_root, 'results_{}'.format(self.opts.test_iter))
+        else:
+            save_path = self.opts.save_path
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+        
+        root_base_name = os.path.splitext(os.path.basename(video_path))[0]
+        if save_mesh:
+            mesh_save_path = os.path.join(save_path, 'mesh')
+        overlay_origin_save_path = os.path.join(save_path, 'overlay')
+        overlay_save_path = os.path.join(save_path, 'overlay_crop')
+        proj_save_path = os.path.join(save_path, 'proj')
+        coeff_save_path = os.path.join(save_path, 'coeffs')
+
+        if save_mesh and not os.path.exists(mesh_save_path):
+            os.makedirs(mesh_save_path)
+        if not os.path.exists(overlay_save_path):
+            os.makedirs(overlay_save_path)
+        if not os.path.exists(overlay_origin_save_path):
+            os.makedirs(overlay_origin_save_path)
+        if not os.path.exists(proj_save_path):
+            os.makedirs(proj_save_path)
+        if not os.path.exists(coeff_save_path):
+            os.makedirs(coeff_save_path)
+
+        coeff_bs_list = []
+        coeff_angle_list = []
+
+        video_reader = cv2.VideoCapture(video_path)
+        fps = video_reader.get(cv2.CAP_PROP_FPS)
+        length = int(video_reader.get(cv2.CAP_PROP_FRAME_COUNT))
+        height = int(video_reader.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        width = int(video_reader.get(cv2.CAP_PROP_FRAME_WIDTH))
+
+        print(f"==> Video FPS: {fps}")
+        print(f"==> Total frames: {length}")
+        print(f"==> Video resolution (h, w): {height}x{width}")
+
+        self.network.eval()
+        with torch.no_grad():
+            # idx = 0
+            for idx in tqdm(range(length)):
+                ret, frame = video_reader.read()
+                if not ret:
+                    break
+
+                # detect bbox
+                if self.opts.detect_type == 'box':
+                    boxes = face_detector(frame)
+                    if len(boxes) == 0:
+                        print('No face detected of frame #{}'.format(idx+1))
+                        continue
+                    bbox = boxes[0]
+                else:
+                    bbox, _ = face_detector.detect(frame)
+                    if bbox is None:
+                        print('No face detected of frame # {}'.format(idx+1))
+                        continue
+                
+                # preprocess data
+                # [bs, c, h, w]
+                input_data, roi_box = Preprocess(frame, self.opts.input_size, bbox, self.opts.detect_type, return_box=True)
+                input_data = input_data.to(self.device)
+
+                # network inference
+                pred_coeffs = self.network(input_data)  # [bs, 159]
+
+                # rendered_img: [1, h, w, 4]
+                rendered_img, pred_lm2d, coeffs, mesh = self.FaceDecoder.decode_face(pred_coeffs, return_coeffs=True)
+                render_mask = rendered_img[:, :, :, 3].detach()
+                rendered_img = rendered_img[:, :, :, :3]
+
                 # save retargeting parameters
                 coeff_bs = coeffs['coeff_bs']
                 coeff_angle = coeffs['coeff_angle']
@@ -196,7 +336,7 @@ class TestSolver(object):
                     rr1, cc1 = draw.disk((pred_lm2d_ori[k][1], pred_lm2d_ori[k][0]), 2)
                     draw.set_color(eval_proj_image, [rr1, cc1], [0, 0, 255])
 
-                base_input_name = os.path.basename(frame_path)[:-4]
+                base_input_name = f"{root_base_name}_{idx+1:04d}"
                 # save parameters
                 coeff_name = base_input_name + '_coeff.mat'
                 for key in coeffs.keys():
@@ -211,14 +351,16 @@ class TestSolver(object):
                 # save image with projected landmarks
                 proj_name = base_input_name + '_proj.jpg'
                 cv2.imwrite(os.path.join(proj_save_path, proj_name), eval_proj_image)
+
                 # save mesh
-                face_shape, tri, face_color = mesh
-                face_shape = face_shape[0].detach().cpu()
-                face_shape[:, 2] = -face_shape[:, 2] # pytorch3d camera coordinate -> opengl camera coordinate
-                tri = tri[0].detach().cpu()
-                face_color = face_color[0].detach().cpu() / 255.0
-                obj_name = base_input_name + '_mesh.obj'
-                write_obj(os.path.join(mesh_save_path, obj_name), face_shape, tri + 1, face_color)
+                if save_mesh:
+                    face_shape, tri, face_color = mesh
+                    face_shape = face_shape[0].detach().cpu()
+                    face_shape[:, 2] = -face_shape[:, 2] # pytorch3d camera coordinate -> opengl camera coordinate
+                    tri = tri[0].detach().cpu()
+                    face_color = face_color[0].detach().cpu() / 255.0
+                    obj_name = base_input_name + '_mesh.obj'
+                    write_obj(os.path.join(mesh_save_path, obj_name), face_shape, tri + 1, face_color)
 
             coeff_bs_array = torch.cat(coeff_bs_list)
             coeff_angle_array = torch.cat(coeff_angle_list)
@@ -231,8 +373,15 @@ class TestSolver(object):
             np.savetxt(os.path.join(save_path, coeff_bs_name), coeff_bs_array)
             np.savetxt(os.path.join(save_path, coeff_angle_name), coeff_angle_array)
 
+            coeff_bs_name = 'coeff_bs.npy'
+            coeff_angle_name = 'coeff_angle.npy'
+
+            np.save(os.path.join(save_path, coeff_bs_name), coeff_bs_array)
+            np.save(os.path.join(save_path, coeff_angle_name), coeff_angle_array)
 
     def render_shape(self, image_path, face_detector):
+        from render_api import render
+
         if self.opts.save_path is None:
             save_path = os.path.join(self.opts.result_root, 'results_{}'.format(self.opts.test_iter))
         else:
@@ -242,7 +391,6 @@ class TestSolver(object):
 
         self.network.eval()
         with torch.no_grad():
-
             if os.path.isfile(image_path):
                 image_paths = [image_path]
             else:
@@ -263,6 +411,7 @@ class TestSolver(object):
                     if bbox is None:
                         print('No face detected of {}'.format(image_path))
                         continue
+
                 # preprocess data
                 # [bs, c, h, w]
                 input_data, roi_box = Preprocess(frame, self.opts.input_size, bbox, self.opts.detect_type, return_box=True)
@@ -287,7 +436,6 @@ class TestSolver(object):
                 triangle_array = triangle_array[:, ::-1]
                 triangle_array = triangle_array.copy(order='C')
 
-                from render_api import render
                 eval_overlay_image = frame.copy()
                 overlay_image = render(eval_overlay_image, face_shape_2d_ori_array, triangle_array, alpha=0.8)
 
@@ -295,6 +443,84 @@ class TestSolver(object):
                 overlay_name = base_input_name + '_overlay.jpg'
                 cv2.imwrite(os.path.join(save_path, overlay_name), overlay_image)
 
+    def render_shape_from_video_path(self, video_path, face_detector):
+        from render_api import render
+
+        assert os.path.isfile(video_path), 'Video path is not exist!'
+
+        if self.opts.save_path is None:
+            save_path = os.path.join(self.opts.result_root, 'results_{}'.format(self.opts.test_iter))
+        else:
+            save_path = self.opts.save_path
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+
+        root_base_name = os.path.splitext(os.path.basename(video_path))[0]
+
+        video_reader = cv2.VideoCapture(video_path)
+        fps = video_reader.get(cv2.CAP_PROP_FPS)
+        length = int(video_reader.get(cv2.CAP_PROP_FRAME_COUNT))
+        height = int(video_reader.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        width = int(video_reader.get(cv2.CAP_PROP_FRAME_WIDTH))
+
+        print(f"==> Video FPS: {fps}")
+        print(f"==> Total frames: {length}")
+        print(f"==> Video resolution (h, w): {height}x{width}")
+
+        # idx = 0
+        self.network.eval()
+        with torch.no_grad():
+            for idx in tqdm(range(length)):
+                ret, frame = video_reader.read()
+                if not ret:
+                    break
+
+                # print('==> Process frames [{}/{}].'.format(idx+1, length))
+
+                # detect bbox
+                if self.opts.detect_type == 'box':
+                    boxes = face_detector(frame)
+                    if len(boxes) == 0:
+                        print(f'No face detected of frame #{idx+1}')
+                        continue
+                    bbox = boxes[0]
+                else:
+                    bbox, _ = face_detector.detect(frame)
+                    if bbox is None:
+                        print(f'No face detected of frame #{idx+1}')
+                        continue
+                
+                # preprocess data
+                # [bs, c, h, w]
+                input_data, roi_box = Preprocess(frame, self.opts.input_size, bbox, self.opts.detect_type, return_box=True)
+                input_data = input_data.to(self.device)
+
+                # network inference
+                pred_coeffs = self.network(input_data)  # [bs, 159]
+
+                # get vertices on the original image plane
+                face_shape_2d = self.FaceDecoder.get_face_on_2d_plane(pred_coeffs)
+                face_shape_2d = face_shape_2d[0].detach().cpu()
+                face_shape_2d_ori = similar_transform_3d(face_shape_2d, roi_box, self.opts.input_size)
+
+                # vertices input for render function
+                face_shape_2d_ori_array = face_shape_2d_ori.numpy()
+                face_shape_2d_ori_array = face_shape_2d_ori_array
+                face_shape_2d_ori_array[:, 2] = -1 * face_shape_2d_ori_array[:, 2]
+                face_shape_2d_ori_array = face_shape_2d_ori_array.astype(np.float32).copy(order='C')
+
+                # triangle input for render function
+                tri = self.FaceDecoder.facemodel.tri.detach().cpu() - 1
+                triangle_array = tri.numpy().astype(np.int32)
+                triangle_array = triangle_array[:, ::-1]
+                triangle_array = triangle_array.copy(order='C')
+
+                eval_overlay_image = frame.copy()
+                overlay_image = render(eval_overlay_image, face_shape_2d_ori_array, triangle_array, alpha=0.8)
+
+                base_input_name = f"{root_base_name}_{idx+1:04d}"
+                overlay_name = base_input_name + '_overlay.jpg'
+                cv2.imwrite(os.path.join(save_path, overlay_name), overlay_image)
 
     def run_facial_motion_retargeting(self, src_coeff_path, target_img_path, face_detector):
         '''
@@ -340,9 +566,7 @@ class TestSolver(object):
                 src_coeff_path_list = glob.glob(os.path.join(src_coeff_path, '*.mat'))
                 src_coeff_path_list.sort()
 
-            length = len(src_coeff_path_list)
-            for idx, coeff_path in enumerate(src_coeff_path_list):
-                print('process frames [{}/{}].'.format(idx+1, length))
+            for coeff_path in tqdm(src_coeff_path_list):
                 # fetch retargeting parameters
                 src_coeffs = loadmat(coeff_path)
                 src_bs_coeff = src_coeffs['coeff_bs']
